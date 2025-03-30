@@ -171,13 +171,13 @@ class _TraceSurfels(torch.autograd.Function):
         if tracer_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_ray_o, grad_ray_d, grad_means3D, grad_grads3D, grad_grads3D_abs, grad_shs, grad_colors_precomp, grad_others_precomp, grad_opacities, grad_scales, grad_rotations, grad_cov3Ds_precomp = _C.trace_surfels_backward(*args)
+                grad_ray_o, grad_ray_d, grad_means3D, grad_grads3D, grad_shs, grad_colors_precomp, grad_others_precomp, grad_opacities, grad_scales, grad_rotations, grad_cov3Ds_precomp = _C.trace_surfels_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            grad_ray_o, grad_ray_d, grad_means3D, grad_grads3D, grad_grads3D_abs, grad_shs, grad_colors_precomp, grad_others_precomp, grad_opacities, grad_scales, grad_rotations, grad_cov3Ds_precomp = _C.trace_surfels_backward(*args)
+            grad_ray_o, grad_ray_d, grad_means3D, grad_grads3D, grad_shs, grad_colors_precomp, grad_others_precomp, grad_opacities, grad_scales, grad_rotations, grad_cov3Ds_precomp = _C.trace_surfels_backward(*args)
 
         grads = (
             None,
