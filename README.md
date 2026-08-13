@@ -45,6 +45,36 @@ export CUDA_HOME="/usr/local/cuda"
 export OPTIX_HOME=/path/to/optix
 ```
 
+### AMD GPUs
+
+On an AMD GPU with a ROCm build of PyTorch, the tracer runs on [HIP RT](https://github.com/GPUOpen-LibrariesAndSDKs/HIPRT) instead of OptiX, and `setup.py` selects that back end automatically. The HIP RT SDK is included in the `third_party/hiprt` directory as a submodule, in the same way as the OptiX headers, but unlike the header-only OptiX SDK it has to be built once before the tracer is installed.
+
+```bash
+# Clone the repository
+git clone https://github.com/xbillowy/diff-surfel-tracing.git --recursive
+cd diff-surfel-tracing
+
+# Build HIP RT, applying the fixes it still needs (see the patch header for what
+# each one is for; they are HIP RT bugs and are being contributed upstream)
+git -C third_party/hiprt apply ../../third_party/hiprt-rocm-fixes.patch
+export HIP_PATH=/opt/rocm
+cmake -DCMAKE_BUILD_TYPE=Release -DBITCODE=OFF -DNO_UNITTEST=ON -DHIP_PATH=/opt/rocm \
+    -S third_party/hiprt -B third_party/hiprt/build
+cmake --build third_party/hiprt/build --target hiprt03001 -j16
+
+# Install using pip
+export PYTORCH_ROCM_ARCH=gfx942  # the architecture of your GPU
+pip install -v .  # add the `-v` flag for verbose output
+```
+
+If you would rather build HIP RT somewhere outside the repository, set `HIPRT_HOME` to that directory, mirroring `OPTIX_HOME` above.
+
+```bash
+export HIPRT_HOME=/path/to/hiprt
+```
+
+The AMD back end compiles its trace kernels at runtime rather than ahead of time into PTX, so the first trace after an install is slower while the kernels are compiled and written to the on-disk cache.
+
 
 ## 🛠️ Usage
 

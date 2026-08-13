@@ -1,0 +1,455 @@
+Fixes for the HIP RT SDK required by the AMD tracer back end.
+
+Apply to a checkout of GPUOpen-LibrariesAndSDKs/HIPRT at tag 3.1.0.cb09c56
+(commit 8602b8c475255fb922c2792654aae0a6bcdeb0af) before building it:
+
+    git -C <HIPRT checkout> apply third_party/hiprt-rocm-fixes.patch
+
+They are HIP RT bugs, not tracer bugs, and none of them is present at HIP RT
+HEAD as of 2026-08-13. Contributing them upstream to GPUOpen is the durable
+fix; until they land there this patch is the way to reproduce the build.
+
+  Compiler.cpp getCacheFilename  sanitize '/' and '\\' out of the device name
+                                 before it is used as a path component. Names
+                                 such as "AMD Instinct MI250X / MI250" otherwise
+                                 make the kernel cache write fail.
+  Compiler.cpp addCommonOpts     pass --offload-arch=<gcnArch> to the runtime
+                                 compiler. Without it the default target set is
+                                 used, and loading the BVH kernels fails with
+                                 hipErrorInvalidImage on an architecture that is
+                                 not in that set (gfx1201).
+  Compiler.cpp buildProgram      pass only the file name, not the absolute path,
+                                 as the runtime-compiler source name. On Windows
+                                 comgr fails silently (ret=6, empty log) when the
+                                 name starts with a drive letter.
+  Compiler.{h,cpp}, Context.cpp  move the compiler setup out of the constructor
+                                 into an explicit init() the context calls after
+                                 it has made its own context current, so a
+                                 context created from a raw HIP context is
+                                 compiled against the right device.
+  hiprt.cpp, hiprt_libpath.h,    build full library paths from ROCM_PATH /
+  Orochi hipew.cpp               HIP_PATH so the ROCm SDK runtime is loaded in
+                                 preference to a display-driver copy on Windows.
+  Orochi.cpp oroSetRawDevice     initialize the device handle before setting the
+                                 API and device, instead of reinterpreting the
+                                 raw device index as a packed handle.
+  MemoryArena.h, BvhNode.h,      member initializer order, and an uninitialized
+  hiprt_device_impl.h            loop variable, all reported by clang as
+                                 warnings that are errors in this build.
+
+--- a/hiprt/hiprt_libpath.h
++++ b/hiprt/hiprt_libpath.h
+@@ -37,7 +37,9 @@
+ 	"amdhip64.dll", // <- hip '5.x' DLL.
+ 	nullptr };
+ 
+-const char* g_hiprtc_paths[] = { "hiprtc0707.dll", "hiprtc0706.dll", "hiprtc0705.dll", "hiprtc0704.dll", "hiprtc0703.dll",
++const char* g_hiprtc_paths[] = { "hiprtc0714.dll", "hiprtc0713.dll", "hiprtc0712.dll", "hiprtc0711.dll",
++								 "hiprtc0710.dll", "hiprtc0709.dll", "hiprtc0708.dll", "hiprtc0707.dll",
++								 "hiprtc0706.dll", "hiprtc0705.dll", "hiprtc0704.dll", "hiprtc0703.dll",
+ 								 "hiprtc0702.dll", "hiprtc0701.dll", "hiprtc0700.dll", "hiprtc0605.dll", "hiprtc0604.dll",
+ 								 "hiprtc0603.dll", "hiprtc0602.dll", "hiprtc0601.dll", "hiprtc0600.dll", "hiprtc0507.dll",
+ 								 "hiprtc0506.dll", "hiprtc0505.dll", "hiprtc0504.dll", "hiprtc0503.dll", nullptr };
+--- a/hiprt/impl/Compiler.h
++++ b/hiprt/impl/Compiler.h
+@@ -35,9 +35,10 @@
+ class Compiler
+ {
+   public:
+-	Compiler();
+ 	~Compiler();
+ 
++	void init();
++
+ 	Kernel getKernel(
+ 		Context&					 context,
+ 		const std::filesystem::path& moduleName,
+@@ -129,6 +130,7 @@
+ 	bool m_rtip31Support = false;
+ 
+ 	std::string m_rtipStr;
++	std::string m_archStr;
+ 
+ 	std::mutex					  m_kernelMutex;
+ 	std::map<std::string, Kernel> m_kernelCache;
+--- a/hiprt/impl/Compiler.cpp
++++ b/hiprt/impl/Compiler.cpp
+@@ -69,7 +69,8 @@
+ 
+ namespace hiprt
+ {
+-Compiler::Compiler()
++
++void Compiler::init()
+ {
+ 	if ( UseBitcode || UseBakedCompiledKernel || hiprtcCreateProgram == nullptr || hiprtcCompileProgram == nullptr ||
+ 		 hiprtcDestroyProgram == nullptr )
+@@ -202,10 +203,16 @@
+ 	std::vector<const char*>&		options,
+ 	orortcProgram&					progOut )
+ {
++	// Use only the filename (not the full path) as the hiprtc source name.
++	// On Windows, passing an absolute path with a drive letter (e.g. "B:\...") to
++	// hiprtcCreateProgram causes comgr to fail silently (ret=6, empty log).
++	// The source code is provided inline, so the name is only used for diagnostics
++	// and the cache key is separate (moduleName, managed by the caller).
++	const std::string srcName = moduleName.empty() ? std::string() : moduleName.filename().string();
+ 	checkOrortc( orortcCreateProgram(
+ 		&progOut,
+ 		src.c_str(),
+-		moduleName.string().c_str(),
++		srcName.c_str(),
+ 		static_cast<int>( headers.size() ),
+ 		headers.data(),
+ 		includeNames.data() ) );
+@@ -527,6 +534,16 @@
+ 		opts.push_back( m_rtipStr.c_str() );
+ 	}
+ 
++	// Pass the target GPU architecture so hiprtc generates code for the live device.
++	// Without this, hiprtc defaults to a generic target and BVH kernel loading fails
++	// with hipErrorInvalidImage on architectures not in the default set.
++	std::string gcnArch = context.getGcnArchName();
++	if ( !gcnArch.empty() && context.getDeviceName().find( "NVIDIA" ) == std::string::npos )
++	{
++		m_archStr = "--offload-arch=" + gcnArch;
++		opts.push_back( m_archStr.c_str() );
++	}
++
+ 	opts.push_back( "-D__USE_HIP__" );
+ 	opts.push_back( "-std=c++17" );
+ }
+@@ -635,6 +652,11 @@
+ 	std::string driverVersion = context.getDriverVersion();
+ 	std::string deviceName	  = context.getDeviceName();
+ 	deviceName				  = deviceName.substr( 0, deviceName.find( ":" ) );
++	// Some AMD device names (for example "AMD Instinct MI250X / MI250") contain
++	// '/', which std::filesystem::path treats as a directory separator and which
++	// breaks cache file creation. Sanitize path-hostile characters.
++	for ( char& c : deviceName )
++		if ( c == '/' || c == '\\' ) c = '_';
+ 
+ 	std::string moduleHash = moduleName.string() + src;
+ 	moduleHash			   = Utility::format( "%08x", Utility::hashString( moduleHash ) );
+--- a/hiprt/impl/Context.cpp
++++ b/hiprt/impl/Context.cpp
+@@ -39,6 +39,8 @@
+ 	oroApi api = ( input.deviceType == hiprtDeviceAMD ) ? ORO_API_HIP : ORO_API_CUDA;
+ 	oroCtxCreateFromRaw( &m_ctxt, api, input.ctxt );
+ 	m_device = oroSetRawDevice( api, input.device );
++	checkOro( oroCtxSetCurrent( m_ctxt ) );
++	m_compiler.init();
+ }
+ 
+ Context::~Context()
+--- a/hiprt/impl/MemoryArena.h
++++ b/hiprt/impl/MemoryArena.h
+@@ -30,7 +30,7 @@
+ {
+   public:
+ 	HIPRT_HOST_DEVICE MemoryArena( hiprtDevicePtr data, size_t storageSize, uint32_t alignment )
+-		: m_data( data ), m_storageSize( storageSize ), m_alignment( alignment ), m_offset( 0 )
++		: m_data( data ), m_alignment( alignment ), m_offset( 0 ), m_storageSize( storageSize )
+ 	{
+ 	}
+ 
+--- a/hiprt/impl/BvhNode.h
++++ b/hiprt/impl/BvhNode.h
+@@ -1305,7 +1305,7 @@
+ {
+ 	ReferenceNode() = default;
+ 	HIPRT_HOST_DEVICE	   ReferenceNode( uint32_t primIndex ) : m_primIndex( primIndex ) {}
+-	HIPRT_HOST_DEVICE	   ReferenceNode( uint32_t primIndex, const Aabb& box ) : m_primIndex( primIndex ), m_box( box ) {}
++	HIPRT_HOST_DEVICE	   ReferenceNode( uint32_t primIndex, const Aabb& box ) : m_box( box ), m_primIndex( primIndex ) {}
+ 	HIPRT_HOST_DEVICE Aabb aabb() const { return m_box; };
+ 
+ 	Aabb	 m_box;
+--- a/hiprt/impl/hiprt.cpp
++++ b/hiprt/impl/hiprt.cpp
+@@ -28,12 +28,46 @@
+ #include <hiprt/impl/Context.h>
+ #include <hiprt/impl/Header.h>
+ #include <hiprt/impl/Utility.h>
++#include <cstring>
++#include <string>
++#include <vector>
+ 
+ using namespace hiprt;
+ 
++// On Windows, LoadLibraryA with a bare DLL name uses the legacy DLL search
++// order (System32 before PATH entries) so "amdhip64_7.dll" from the AMD
++// display driver wins over the ROCm SDK's copy.  Build full-path lists from
++// ROCM_PATH / HIP_PATH so the ROCm SDK DLLs are loaded instead.
++struct DllPathList {
++    std::vector<std::string> strs;
++    std::vector<const char*> ptrs;
++
++    void build( const char** bare, const char* rocm_dir ) {
++        strs.clear(); ptrs.clear();
++        if ( rocm_dir ) {
++            for ( const char** p = bare; *p; ++p )
++                strs.push_back( std::string( rocm_dir ) + "\\bin\\" + *p );
++        }
++        for ( const char** p = bare; *p; ++p )
++            strs.push_back( *p );
++        for ( auto& s : strs ) ptrs.push_back( s.c_str() );
++        ptrs.push_back( nullptr );
++    }
++    const char** data() { return ptrs.data(); }
++};
++
+ hiprtError hiprtCreateContext( uint32_t hiprtApiVersion, const hiprtContextCreationInput& input, hiprtContext& contextOut )
+ {
++    DllPathList hip_paths, hiprtc_paths;
++#ifdef _WIN32
++    const char* rocm = getenv( "ROCM_PATH" );
++    if ( !rocm ) rocm = getenv( "HIP_PATH" );
++    hip_paths.build( g_hip_paths, rocm );
++    hiprtc_paths.build( g_hiprtc_paths, rocm );
++    oroInitialize( ( input.deviceType == hiprtDeviceAMD ) ? ORO_API_HIP : ORO_API_CUDA, 0, hip_paths.data(), hiprtc_paths.data() );
++#else
+ 	oroInitialize( ( input.deviceType == hiprtDeviceAMD ) ? ORO_API_HIP : ORO_API_CUDA, 0, g_hip_paths, g_hiprtc_paths );
++#endif
+ 	if ( hiprtApiVersion != HIPRT_API_VERSION ) return hiprtErrorInvalidApiVersion;
+ 
+ 	try
+--- a/hiprt/impl/hiprt_device_impl.h
++++ b/hiprt/impl/hiprt_device_impl.h
+@@ -252,7 +252,7 @@
+   public:
+ 	HIPRT_DEVICE TraversalBase(
+ 		const hiprtRay& ray, Stack& stack, hiprtTraversalHint hint, void* payload, hiprtFuncTable funcTable, uint32_t rayType )
+-		: m_ray( ray ), m_stack( stack ), m_payload( payload ), m_rayType( rayType ), m_nodeIndex( RootIndex ), m_hint( hint )
++		: m_ray( ray ), m_stack( stack ), m_payload( payload ), m_nodeIndex( RootIndex ), m_rayType( rayType ), m_hint( hint )
+ 	{
+ 		if ( funcTable != nullptr ) m_tableHeader = *reinterpret_cast<hiprtFuncTableHeader*>( funcTable );
+ #if HIPRT_RTIP >= 11
+@@ -939,8 +939,8 @@
+ 	hiprtFuncTable	   funcTable,
+ 	uint32_t		   rayType,
+ 	float			   time )
+-	: TraversalBase<Stack, TraversalType>( ray, stack, hint, payload, funcTable, rayType ), m_time( time ), m_mask( mask ),
+-	  m_instanceStack( instanceStack ), m_level( 0u )
++	: TraversalBase<Stack, TraversalType>( ray, stack, hint, payload, funcTable, rayType ), m_instanceStack( instanceStack ), m_mask( mask ),
++	  m_level( 0u ), m_time( time )
+ {
+ 	SceneHeader* sceneHeader = reinterpret_cast<SceneHeader*>( scene );
+ 	m_boxNodes				 = sceneHeader->m_boxNodes;
+@@ -1823,24 +1823,29 @@
+ 	hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
+ 	float3				p			= point;
+ 
+-	uint32_t depth;
++	uint32_t depth = 0;
+ #pragma unroll
+-	for ( depth = 1; depth < hiprtMaxInstanceLevels; ++depth )
++	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
+ 	{
+-		sceneHeaders[depth - 1] = sceneHeader;
+-		const auto& instance	= sceneHeader->m_instances[instanceIDs[depth - 1]];
++		sceneHeaders[i] = sceneHeader;
++		const auto& instance = sceneHeader->m_instances[instanceIDs[i]];
++		++depth;
+ 		if ( instance.m_type != hiprtInstanceTypeScene ) break;
+ 		sceneHeader = instance.m_scene;
+ 	}
+ 
+ #pragma unroll
+-	for ( int32_t i = depth - 1; i >= 0; --i )
++	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
+ 	{
+-		sceneHeader				  = sceneHeaders[i];
+-		const auto&		 instance = sceneHeader->m_instances[instanceIDs[i]];
+-		hiprt::Transform tr		  = hiprt::Transform( sceneHeader->m_frames, instance.m_frameIndex, instance.m_frameCount );
+-		hiprt::Frame	 frame	  = tr.interpolateFrames( time );
+-		p						  = frame.transform( p );
++		int32_t j = depth - 1 - i;
++		if ( j >= 0 )
++		{
++			sceneHeader				  = sceneHeaders[j];
++			const auto&		 instance = sceneHeader->m_instances[instanceIDs[j]];
++			hiprt::Transform tr		  = hiprt::Transform( sceneHeader->m_frames, instance.m_frameIndex, instance.m_frameCount );
++			hiprt::Frame	 frame	  = tr.interpolateFrames( time );
++			p						  = frame.transform( p );
++		}
+ 	}
+ 
+ 	return p;
+@@ -1873,24 +1878,29 @@
+ 	hiprt::SceneHeader* sceneHeader = reinterpret_cast<hiprt::SceneHeader*>( scene );
+ 	float3				v			= vector;
+ 
+-	uint32_t depth;
++	uint32_t depth = 0;
+ #pragma unroll
+-	for ( depth = 1; depth < hiprtMaxInstanceLevels; ++depth )
++	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
+ 	{
+-		sceneHeaders[depth - 1] = sceneHeader;
+-		const auto& instance	= sceneHeader->m_instances[instanceIDs[depth - 1]];
++		sceneHeaders[i] = sceneHeader;
++		const auto& instance = sceneHeader->m_instances[instanceIDs[i]];
++		++depth;
+ 		if ( instance.m_type != hiprtInstanceTypeScene ) break;
+ 		sceneHeader = instance.m_scene;
+ 	}
+ 
+ #pragma unroll
+-	for ( int32_t i = depth - 1; i >= 0; --i )
++	for ( uint32_t i = 0; i < hiprtMaxInstanceLevels; ++i )
+ 	{
+-		sceneHeader				  = sceneHeaders[i];
+-		const auto&		 instance = sceneHeader->m_instances[instanceIDs[i]];
+-		hiprt::Transform tr		  = hiprt::Transform( sceneHeader->m_frames, instance.m_frameIndex, instance.m_frameCount );
+-		hiprt::Frame	 frame	  = tr.interpolateFrames( time );
+-		v						  = frame.transformVector( v );
++		int32_t j = depth - 1 - i;
++		if ( j >= 0 )
++		{
++			sceneHeader				  = sceneHeaders[j];
++			const auto&		 instance = sceneHeader->m_instances[instanceIDs[j]];
++			hiprt::Transform tr		  = hiprt::Transform( sceneHeader->m_frames, instance.m_frameIndex, instance.m_frameCount );
++			hiprt::Frame	 frame	  = tr.interpolateFrames( time );
++			v						  = frame.transformVector( v );
++		}
+ 	}
+ 
+ 	return v;
+@@ -1916,6 +1926,108 @@
+ 	return v;
+ }
+ 
++// transformation getters
++HIPRT_DEVICE hiprtFrameSRT hiprtGetObjectToWorldFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
++{
++    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
++    const hiprt::Transform    tr(
++           sceneHeader->m_frames,
++           sceneHeader->m_instances[instanceID].m_frameIndex,
++           sceneHeader->m_instances[instanceID].m_frameCount );
++    const hiprt::Frame frame = tr.interpolateFrames( time );
++
++	hiprt::SRTFrame srtFrame;
++#if defined( HIPRT_MATRIX_FRAME )
++	hiprtFrameMatrix mf;
++	memcpy( mf.matrix, frame.m_matrix, sizeof( mf.matrix ) );
++	mf.time = frame.m_time;
++	srtFrame = hiprt::SRTFrame( mf );
++#else
++	srtFrame = frame;
++#endif
++
++    hiprtFrameSRT result;
++    result.rotation    = hiprt::qtToAxisAngle( srtFrame.m_rotation );
++    result.scale       = srtFrame.m_scale;
++    result.translation = srtFrame.m_translation;
++    result.time        = srtFrame.m_time;
++    return result;
++}
++
++HIPRT_DEVICE hiprtFrameSRT hiprtGetWorldToObjectFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
++{
++    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
++    const hiprt::Transform    tr(
++           sceneHeader->m_frames,
++           sceneHeader->m_instances[instanceID].m_frameIndex,
++           sceneHeader->m_instances[instanceID].m_frameCount );
++    const hiprt::Frame frame = tr.interpolateFrames( time );
++
++    float matrixInv[3][4];
++    hiprt::computeInvTransformMatrix( frame, matrixInv );
++
++    hiprtFrameMatrix mf;
++    memcpy( mf.matrix, matrixInv, sizeof( matrixInv ) );
++    mf.time = frame.m_time;
++
++    const hiprt::SRTFrame invSrtFrame( mf );
++
++    hiprtFrameSRT result;
++    result.rotation    = hiprt::qtToAxisAngle( invSrtFrame.m_rotation );
++    result.scale       = invSrtFrame.m_scale;
++    result.translation = invSrtFrame.m_translation;
++    result.time        = invSrtFrame.m_time;
++    return result;
++}
++
++HIPRT_DEVICE hiprtFrameMatrix hiprtGetObjectToWorldFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
++{
++    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
++    const hiprt::Transform    tr(
++           sceneHeader->m_frames,
++           sceneHeader->m_instances[instanceID].m_frameIndex,
++           sceneHeader->m_instances[instanceID].m_frameCount );
++    const hiprt::Frame frame = tr.interpolateFrames( time );
++
++	hiprtFrameMatrix result;
++#if defined( HIPRT_MATRIX_FRAME )
++	memcpy( result.matrix, frame.m_matrix, sizeof( result.matrix ) );
++	result.time = frame.m_time;
++#else
++	float Q[3][3];
++	hiprt::qtToRotationMatrix( frame.m_rotation, Q );
++	for ( uint32_t i = 0; i < 3; ++i )
++	{
++		result.matrix[i][0] = Q[i][0] * frame.m_scale.x;
++		result.matrix[i][1] = Q[i][1] * frame.m_scale.y + Q[i][0] * frame.m_shear.x;
++		result.matrix[i][2] = Q[i][2] * frame.m_scale.z + Q[i][1] * frame.m_shear.z + Q[i][0] * frame.m_shear.y;
++	}
++	result.matrix[0][3] = frame.m_translation.x;
++	result.matrix[1][3] = frame.m_translation.y;
++	result.matrix[2][3] = frame.m_translation.z;
++	result.time         = frame.m_time;
++#endif
++    return result;
++}
++
++HIPRT_DEVICE hiprtFrameMatrix hiprtGetWorldToObjectFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
++{
++    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
++    const hiprt::Transform    tr(
++           sceneHeader->m_frames,
++           sceneHeader->m_instances[instanceID].m_frameIndex,
++           sceneHeader->m_instances[instanceID].m_frameCount );
++    const hiprt::Frame frame = tr.interpolateFrames( time );
++
++    float matrixInv[3][4];
++    hiprt::computeInvTransformMatrix( frame, matrixInv );
++
++    hiprtFrameMatrix result;
++    memcpy( result.matrix, matrixInv, sizeof( result.matrix ) );
++    result.time = frame.m_time;
++    return result;
++}
++
+ // explicit template instatiation
+ template class hiprtPrivateStack_impl<uint32_t, hiprtPrivateStack::StackSize>;
+ template class hiprtGlobalStack_impl<uint32_t, false>;
+--- a/contrib/Orochi/Orochi/Orochi.cpp
++++ b/contrib/Orochi/Orochi/Orochi.cpp
+@@ -938,8 +938,9 @@
+ 
+ oroDevice oroSetRawDevice( oroApi api, oroDevice dev ) 
+ {
+-	ioroDevice d( dev );
++	ioroDevice d{};
+ 	d.setApi( api );
++	d.setDevice( dev );
+ 	return *(oroDevice*)&d;
+ }
+ 
+--- a/contrib/Orochi/contrib/hipew/src/hipew.cpp
++++ b/contrib/Orochi/contrib/hipew/src/hipew.cpp
+@@ -625,6 +625,13 @@
+       "amdhip64.dll",   // <- hip '5.x' DLL.
+       NULL };
+   const char* hiprtc_paths[] = {
++      "hiprtc0714.dll",
++      "hiprtc0713.dll",
++      "hiprtc0712.dll",
++      "hiprtc0711.dll",
++      "hiprtc0710.dll",
++      "hiprtc0709.dll",
++      "hiprtc0708.dll",
+       "hiprtc0707.dll",
+       "hiprtc0706.dll",
+       "hiprtc0705.dll",
