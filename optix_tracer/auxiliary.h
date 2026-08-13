@@ -400,7 +400,15 @@ inline __device__ void quat_to_rotmat(const float4& quat, float3* R) {
 	);
 }
 
-inline __device__ float3 quat_to_rotmat_transpose(const float4& quat, float3* R) {
+// Fills the (transposed) rotation matrix R in place. This was declared to return
+// float3 but has no return statement, and every caller discards the result, so
+// falling off the end is undefined behavior. nvcc tolerates it because the dead
+// return register is never read; clang-based HIP compilation does not. Inlined
+// into the register-heavy backward traversal, the undefined return path lets the
+// optimizer poison R, which NaNs the surfel normal and every geometric gradient
+// on the heavily hit disks. Returning void removes the undefined behavior at the
+// source and is correct on both back ends.
+inline __device__ void quat_to_rotmat_transpose(const float4& quat, float3* R) {
 	// quat to rotation matrix
 	float s = rsqrtf(
 		quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
