@@ -9,6 +9,25 @@ They are HIP RT bugs, not tracer bugs, and none of them is present at HIP RT
 HEAD as of 2026-08-13. Contributing them upstream to GPUOpen is the durable
 fix; until they land there this patch is the way to reproduce the build.
 
+  BvhBuilderKernels.h            build the per-subwarp lane mask in 64 bits.
+  subwarpMask (3 sites)          "( 1 << BranchingFactor ) - 1" is an int, so
+                                 shifting it by BranchingFactor * subwarpIndex
+                                 is undefined once that reaches 32, which it
+                                 does for lanes 32..63 of a 64-wide wavefront.
+                                 The hardware shift uses only the low 5 bits of
+                                 the count, so the upper half of the wavefront
+                                 silently gets the lower half's mask. openNodes
+                                 then picks the widest child from the wrong
+                                 subwarp and can open one subtree twice, so
+                                 Collapse emits more references than there are
+                                 primitives; its exit test compares the emitted
+                                 count against the primitive count for equality
+                                 and the overshoot makes every lane spin
+                                 forever. A BVH build over a few dozen
+                                 primitives hangs the GPU on gfx90a and gfx942.
+                                 32-wide wavefronts never reach a shift of 32
+                                 and are unaffected, which is why this survives
+                                 on RDNA.
   Compiler.cpp getCacheFilename  sanitize '/' and '\\' out of the device name
                                  before it is used as a path component. Names
                                  such as "AMD Instinct MI250X / MI250" otherwise
@@ -50,6 +69,35 @@ fix; until they land there this patch is the way to reproduce the build.
  								 "hiprtc0702.dll", "hiprtc0701.dll", "hiprtc0700.dll", "hiprtc0605.dll", "hiprtc0604.dll",
  								 "hiprtc0603.dll", "hiprtc0602.dll", "hiprtc0601.dll", "hiprtc0600.dll", "hiprtc0507.dll",
  								 "hiprtc0506.dll", "hiprtc0505.dll", "hiprtc0504.dll", "hiprtc0503.dll", nullptr };
+--- a/hiprt/impl/BvhBuilderKernels.h
++++ b/hiprt/impl/BvhBuilderKernels.h
+@@ -141,7 +141,7 @@ HIPRT_DEVICE HIPRT_INLINE void openNodes(
+ 	const uint32_t laneIndex	= threadIdx.x % WarpSize;
+ 	const uint32_t sublaneIndex = laneIndex % BranchingFactor;
+ 	const uint32_t subwarpIndex = laneIndex / BranchingFactor;
+-	const uint64_t subwarpMask	= ( ( 1 << BranchingFactor ) - 1 )
++	const uint64_t subwarpMask	= ( ( 1ull << BranchingFactor ) - 1ull )
+ 								 << static_cast<uint64_t>( ( BranchingFactor * subwarpIndex ) );
+ 
+ 	bool done = childCount == BranchingFactor;
+@@ -706,7 +706,7 @@ __device__ void FitBounds( Header* header, PrimitiveContainer& primitives, BoxNo
+ 	const uint32_t laneIndex	= threadIdx.x % WarpSize;
+ 	const uint32_t sublaneIndex = laneIndex % BranchingFactor;
+ 	const uint32_t subwarpIndex = laneIndex / BranchingFactor;
+-	const uint64_t subwarpMask	= ( ( 1 << BranchingFactor ) - 1 )
++	const uint64_t subwarpMask	= ( ( 1ull << BranchingFactor ) - 1ull )
+ 								 << static_cast<uint64_t>( ( BranchingFactor * subwarpIndex ) );
+ 
+ 	uint32_t index = threadIndex / BranchingFactor;
+@@ -1101,7 +1101,7 @@ __device__ void Collapse(
+ 	const uint32_t taskIndex	= index / BranchingFactor;
+ 	const uint32_t sublaneIndex = laneIndex % BranchingFactor;
+ 	const uint32_t subwarpIndex = laneIndex / BranchingFactor;
+-	const uint64_t subwarpMask	= ( ( 1 << BranchingFactor ) - 1 )
++	const uint64_t subwarpMask	= ( ( 1ull << BranchingFactor ) - 1ull )
+ 								 << static_cast<uint64_t>( ( BranchingFactor * subwarpIndex ) );
+ 
+ 	bool done = taskIndex >= maxBoxNodeCount || taskIndex >= referenceCount;
 --- a/hiprt/impl/Compiler.h
 +++ b/hiprt/impl/Compiler.h
 @@ -35,9 +35,10 @@
