@@ -5,14 +5,19 @@ Apply to a checkout of GPUOpen-LibrariesAndSDKs/HIPRT at tag 3.1.0.cb09c56
 
     git -C <HIPRT checkout> apply third_party/hiprt-rocm-fixes.patch
 
-They are HIP RT bugs, not tracer bugs, and none of them is present at HIP RT
-HEAD as of 2026-08-14. Contributing them upstream to GPUOpen is the durable
-fix; until they land there this patch is the way to reproduce the build.
+They are bugs in HIP RT and in the copy of Orochi it vendors, not tracer bugs,
+and none of them is fixed at HIP RT HEAD as of 2026-08-14. Contributing them
+upstream to GPUOpen is the durable fix; until they land there this patch is the
+way to reproduce the build.
 
-The first three entries are one defect in three shapes: a 64-bit lane mask
-combined with a 32-bit shift expression. Only the shift's left operand decides
+The first four entries are one defect in four shapes: a value that describes all
+64 lanes of a wavefront, handled in 32 bits. Three of them are a 64-bit lane mask
+combined with a 32-bit shift expression -- only the shift's left operand decides
 the type, so "1" and "1u" produce a 32-bit value that is then widened, and on a
-64-wide wavefront the upper half of the mask is wrong.
+64-wide wavefront the upper half of the mask is wrong. The fourth stores a whole
+64-lane ballot in a u32, which keeps the lower half of the wavefront and throws
+away the calling lane's own half. That one is in the vendored Orochi rather than
+in hiprt/, and it is on the path every scene of a realistic size takes.
 
   BvhBuilderKernels.h            build the per-subwarp lane mask in 64 bits.
   subwarpMask (3 sites)          "( 1 << BranchingFactor ) - 1" is an int, so
@@ -57,6 +62,24 @@ the type, so "1" and "1u" produce a 32-bit value that is then widened, and on a
                                  "while ( packetMask )" then cannot clear.
                                  PackLeavesWarp builds TrianglePacketNode, which
                                  is selected for RTIP 3.1 and later (gfx1201).
+  Orochi RadixSortKernels.h      read the calling lane's own logical warp out of
+  OnesweepReorder broThreads     the wavefront ballot. The kernel treats a
+                                 256-thread block as eight logical warps of
+                                 WARP_SIZE (32) lanes, but __ballot() reports all
+                                 64 lanes of the wavefront, and "u32 broThreads =
+                                 __ballot( ... )" keeps bits 0..31 -- so every odd
+                                 logical warp ranks its keys against the even
+                                 warp's attendee set. warpOffsets and lpSum are
+                                 then wrong for half the block, and those prefix
+                                 sums index the global outputKeys and outputValues
+                                 writes. Measured on gfx90a: a build over more
+                                 than 3072 primitives dies with "Memory access
+                                 fault ... kernel: OnesweepReorderKeyPair64".
+                                 Below that count RadixSort.cpp selects the
+                                 single-pass kernel and this one never runs, which
+                                 is why only scenes of a realistic size hit it.
+                                 32-wide wavefronts shift by zero and are
+                                 unaffected.
   Compiler.cpp getCacheFilename  sanitize '/' and '\\' out of the device name
                                  before it is used as a path component. Names
                                  such as "AMD Instinct MI250X / MI250" otherwise
@@ -415,6 +438,56 @@ the type, so "1" and "1u" produce a 32-bit value that is then widened, and on a
  	}
  
  	return v;
+--- a/contrib/Orochi/ParallelPrimitives/RadixSortKernels.h
++++ b/contrib/Orochi/ParallelPrimitives/RadixSortKernels.h
+@@ -402,6 +402,21 @@ extern "C" __global__ void GHistogram( RADIX_SORT_KEY_TYPE* inputs, u32 numberOf
+ 	}
+ }
+ 
++// __ballot_sync() and __ballot() cover a whole hardware warp or wavefront,
++// but OnesweepReorder splits the block into WARP_SIZE-wide logical warps and a
++// 64-wide wavefront holds two of them. Return only the calling lane's own
++// logical warp, so bit i of the result belongs to its lane i. On a 32-wide
++// wavefront the shift is zero and the result is unchanged.
++__device__ inline u32 logicalWarpBallot( bool predicate )
++{
++#if defined( ITS )
++	return __ballot_sync( 0xFFFFFFFF, predicate );
++#else
++	const u32 logicalWarpInWave = ( threadIdx.x % warpSize ) / WARP_SIZE;
++	return static_cast<u32>( __ballot( predicate ) >> ( logicalWarpInWave * WARP_SIZE ) );
++#endif
++}
++
+ template <bool keyPair>
+ __device__ __forceinline__ void OnesweepReorder( RADIX_SORT_KEY_TYPE* inputKeys, RADIX_SORT_KEY_TYPE* outputKeys, RADIX_SORT_VALUE_TYPE* inputValues, RADIX_SORT_VALUE_TYPE* outputValues, u32 numberOfInputs, u32* gpSumBuffer,
+ 												  volatile u64* lookBackBuffer, u32* tailIterator, u32 startBits, u32 iteration )
+@@ -462,23 +477,12 @@ __device__ __forceinline__ void OnesweepReorder( RADIX_SORT_KEY_TYPE* inputKeys,
+ 		u32 bucketIndex = extractDigit( getKeyBits( keys[k] ), bitLocation );
+ 
+ 		// check the attendees
+-		u32 broThreads =
+-#if defined( ITS )
+-			__ballot_sync( 0xFFFFFFFF,
+-#else
+-			__ballot(
+-#endif
+-						   itemIndex < numberOfInputs );
++		u32 broThreads = logicalWarpBallot( itemIndex < numberOfInputs );
+ 
+ 		for( int j = 0; j < N_RADIX; ++j )
+ 		{
+ 			u32 bit = ( bucketIndex >> j ) & 0x1;
+-			u32 difference = ( 0xFFFFFFFF * bit ) ^
+-#if defined( ITS )
+-								__ballot_sync( 0xFFFFFFFF, bit != 0 );
+-#else
+-								__ballot( bit != 0 );
+-#endif
++			u32 difference = ( 0xFFFFFFFF * bit ) ^ logicalWarpBallot( bit != 0 );
+ 			broThreads &= ~difference;
+ 		}
+ 
 --- a/contrib/Orochi/Orochi/Orochi.cpp
 +++ b/contrib/Orochi/Orochi/Orochi.cpp
 @@ -938,8 +938,9 @@
