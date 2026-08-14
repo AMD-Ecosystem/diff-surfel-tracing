@@ -8,7 +8,7 @@
  * Where OptiX loaded offline PTX and built a pipeline/SBT, this JIT-compiles the
  * trace kernels (kernels.h) at runtime via HIPRT (Orochi -> hiprtc), registers the
  * hit-collection filter functor in a func table, builds the surfel-disk triangle
- * BVH, and launches the kernels. Authored with Claude (Anthropic).
+ * BVH, and launches the kernels.
  */
 
 #include <cstdio>
@@ -165,7 +165,7 @@ OptiXStateWrapper::OptiXStateWrapper(const std::string& pkg_dir)
     // register-heavy traversal kernels -- values that cross the chunk-traversal
     // region (the chunk count, the per-hit transform outputs) read stale/zero/NaN.
     // Declaring the small block size relaxes the VGPR limit and makes codegen
-    // correct. See PORTING_GUIDE OptiX->HIPRT and UPSTREAM_FINDINGS.
+    // correct.
     opts.push_back("--gpu-max-threads-per-block=64");
 
     hiprtFuncNameSet fns{};

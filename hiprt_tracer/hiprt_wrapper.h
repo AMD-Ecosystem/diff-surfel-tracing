@@ -10,8 +10,6 @@
  * So this interface exposes ONLY plain C++ / POD / void* entry points; no Orochi or
  * HIPRT types leak across it. The public class name OptiXStateWrapper is preserved so
  * ext.cpp and diff_surfel_tracing/__init__.py are unchanged.
- *
- * Authored with Claude (Anthropic).
  */
 
 #pragma once

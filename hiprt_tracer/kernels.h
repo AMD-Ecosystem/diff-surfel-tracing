@@ -9,7 +9,7 @@
  *   - the backward path-tracing kernel backward_kernel (was __raygen__ot bwd)
  *   - the hit-collection filter functor surfelFilter   (was __anyhit__ot)
  *
- * OptiX -> HIPRT mapping (see PORTING_GUIDE "OptiX->HIPRT reimplementation"):
+ * OptiX -> HIPRT mapping:
  *   optixTrace(handle, o, d, ...)         -> hiprtGeomTraversalAnyHit tr(geom,
  *                                            ray, hint, &payload, funcTable);
  *                                            tr.getNextHit();  // drives filter
@@ -28,7 +28,7 @@
  *
  * The volume-rendering, chunked-retrace, and gradient math are reused verbatim
  * from the OptiX sources; only the ray-traversal calls and launch-index/param
- * access differ. Authored with Claude (Anthropic).
+ * access differ.
  */
 
 #include <hip/hip_runtime.h>
@@ -1053,8 +1053,8 @@ extern "C" __global__ void __launch_bounds__(64) backward_kernel(const Params* p
     // backward register pressure, hiprtc/comgr (ROCm 7.2.x) miscompiles reads of
     // large kernel-local arrays loaded from global -- the values come back stale
     // (NaN/garbage), which then poisons dL_dalpha (the out_rgb-C term) and every
-    // gradient. Global pointers are pressure-immune (the chunk_buffer lesson). See
-    // PORTING_GUIDE OptiX->HIPRT.
+    // gradient. Global pointers are pressure-immune, which is why the per-ray hit
+    // chunk lives in params.chunk_buffer rather than on the stack.
     const float* out_rgb = params.out_rgb + NUM_CHANNELS * tidx;
     float out_dpt = params.out_dpt[tidx];
     float out_acc = params.out_acc[tidx];
