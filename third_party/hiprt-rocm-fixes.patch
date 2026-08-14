@@ -6,8 +6,13 @@ Apply to a checkout of GPUOpen-LibrariesAndSDKs/HIPRT at tag 3.1.0.cb09c56
     git -C <HIPRT checkout> apply third_party/hiprt-rocm-fixes.patch
 
 They are HIP RT bugs, not tracer bugs, and none of them is present at HIP RT
-HEAD as of 2026-08-13. Contributing them upstream to GPUOpen is the durable
+HEAD as of 2026-08-14. Contributing them upstream to GPUOpen is the durable
 fix; until they land there this patch is the way to reproduce the build.
+
+The first three entries are one defect in three shapes: a 64-bit lane mask
+combined with a 32-bit shift expression. Only the shift's left operand decides
+the type, so "1" and "1u" produce a 32-bit value that is then widened, and on a
+64-wide wavefront the upper half of the mask is wrong.
 
   BvhBuilderKernels.h            build the per-subwarp lane mask in 64 bits.
   subwarpMask (3 sites)          "( 1 << BranchingFactor ) - 1" is an int, so
@@ -28,6 +33,30 @@ fix; until they land there this patch is the way to reproduce the build.
                                  32-wide wavefronts never reach a shift of 32
                                  and are unaffected, which is why this survives
                                  on RDNA.
+  BvhBuilderKernels.h            clear the paired lane with a 64-bit literal.
+  PairTriangles activeMask       "~( 1u << firstPairedLane )" is an unsigned
+                                 int, so it zero-extends into the 64-bit AND and
+                                 clears bits 32..63 of activeMask whatever the
+                                 lane is. The loop that gives each lane its turn
+                                 as the broadcast lane then stops as soon as the
+                                 low 32 bits drain, lanes 32..63 keep
+                                 pairedIndex == InvalidValue, and their
+                                 triangles are never written to pairIndices --
+                                 so half of every 64-wide wavefront's triangles
+                                 are absent from the BVH. The build succeeds
+                                 and the image looks plausible; the missing
+                                 geometry is only visible if something counts
+                                 the primitives that were actually traced.
+                                 Measured on gfx90a: 31 of 64 surfels receive a
+                                 gradient before the fix, 62 of 64 after it.
+  BvhBuilderKernels.h            same, with the opposite failure. "1 <<
+  PackLeavesWarp packetMask      broadcastLane" is a signed int, so at lane 31
+                                 it is INT_MIN and sign-extends to
+                                 0xffffffff80000000 when it is xored into the
+                                 64-bit packetMask, setting bits 32..63 that
+                                 "while ( packetMask )" then cannot clear.
+                                 PackLeavesWarp builds TrianglePacketNode, which
+                                 is selected for RTIP 3.1 and later (gfx1201).
   Compiler.cpp getCacheFilename  sanitize '/' and '\\' out of the device name
                                  before it is used as a path component. Names
                                  such as "AMD Instinct MI250X / MI250" otherwise
@@ -80,6 +109,15 @@ fix; until they land there this patch is the way to reproduce the build.
  								 << static_cast<uint64_t>( ( BranchingFactor * subwarpIndex ) );
  
  	bool done = childCount == BranchingFactor;
+@@ -402,7 +402,7 @@
+ 		const uint32_t firstPairedLane = __ffsll( static_cast<unsigned long long>( hiprt::ballot( pairable ) ) ) - 1;
+ 		if ( firstPairedLane < WarpSize )
+ 		{
+-			activeMask &= ~( 1u << firstPairedLane );
++			activeMask &= ~( 1ull << firstPairedLane );
+ 			if ( laneIndex == firstPairedLane ) valid = false;
+ 
+ 			const uint32_t secondIndex = shfl( index, firstPairedLane );
 @@ -706,7 +706,7 @@ __device__ void FitBounds( Header* header, PrimitiveContainer& primitives, BoxNo
  	const uint32_t laneIndex	= threadIdx.x % WarpSize;
  	const uint32_t sublaneIndex = laneIndex % BranchingFactor;
@@ -98,6 +136,20 @@ fix; until they land there this patch is the way to reproduce the build.
  								 << static_cast<uint64_t>( ( BranchingFactor * subwarpIndex ) );
  
  	bool done = taskIndex >= maxBoxNodeCount || taskIndex >= referenceCount;
+@@ -1986,11 +1986,11 @@
+ 			const uint32_t halfLaneIndex = laneIndex % 16;
+ 
+ 			const uint32_t broadcastLane0 = __ffsll( static_cast<unsigned long long>( packetMask ) ) - 1;
+-			packetMask ^= 1 << broadcastLane0;
++			packetMask ^= 1ull << broadcastLane0;
+ 
+ 			const uint32_t broadcastLane1 = __ffsll( static_cast<unsigned long long>( packetMask ) ) - 1;
+ 			const bool	   secondValid	  = packetMask != 0;
+-			if ( secondValid ) packetMask ^= 1 << broadcastLane1;
++			if ( secondValid ) packetMask ^= 1ull << broadcastLane1;
+ 
+ 			const uint32_t			 broadcastLane			 = ( halfWarpIndex == 0 ) ? broadcastLane0 : broadcastLane1;
+ 			const uint32_t			 broadcastSubwarpIndex	 = broadcastLane / LanesPerLeafPacketTask;
 --- a/hiprt/impl/Compiler.h
 +++ b/hiprt/impl/Compiler.h
 @@ -35,9 +35,10 @@
@@ -363,115 +415,6 @@ fix; until they land there this patch is the way to reproduce the build.
  	}
  
  	return v;
-@@ -1916,6 +1926,108 @@
- 	return v;
- }
- 
-+// transformation getters
-+HIPRT_DEVICE hiprtFrameSRT hiprtGetObjectToWorldFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
-+{
-+    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-+    const hiprt::Transform    tr(
-+           sceneHeader->m_frames,
-+           sceneHeader->m_instances[instanceID].m_frameIndex,
-+           sceneHeader->m_instances[instanceID].m_frameCount );
-+    const hiprt::Frame frame = tr.interpolateFrames( time );
-+
-+	hiprt::SRTFrame srtFrame;
-+#if defined( HIPRT_MATRIX_FRAME )
-+	hiprtFrameMatrix mf;
-+	memcpy( mf.matrix, frame.m_matrix, sizeof( mf.matrix ) );
-+	mf.time = frame.m_time;
-+	srtFrame = hiprt::SRTFrame( mf );
-+#else
-+	srtFrame = frame;
-+#endif
-+
-+    hiprtFrameSRT result;
-+    result.rotation    = hiprt::qtToAxisAngle( srtFrame.m_rotation );
-+    result.scale       = srtFrame.m_scale;
-+    result.translation = srtFrame.m_translation;
-+    result.time        = srtFrame.m_time;
-+    return result;
-+}
-+
-+HIPRT_DEVICE hiprtFrameSRT hiprtGetWorldToObjectFrameSRT( hiprtScene scene, uint32_t instanceID, float time )
-+{
-+    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-+    const hiprt::Transform    tr(
-+           sceneHeader->m_frames,
-+           sceneHeader->m_instances[instanceID].m_frameIndex,
-+           sceneHeader->m_instances[instanceID].m_frameCount );
-+    const hiprt::Frame frame = tr.interpolateFrames( time );
-+
-+    float matrixInv[3][4];
-+    hiprt::computeInvTransformMatrix( frame, matrixInv );
-+
-+    hiprtFrameMatrix mf;
-+    memcpy( mf.matrix, matrixInv, sizeof( matrixInv ) );
-+    mf.time = frame.m_time;
-+
-+    const hiprt::SRTFrame invSrtFrame( mf );
-+
-+    hiprtFrameSRT result;
-+    result.rotation    = hiprt::qtToAxisAngle( invSrtFrame.m_rotation );
-+    result.scale       = invSrtFrame.m_scale;
-+    result.translation = invSrtFrame.m_translation;
-+    result.time        = invSrtFrame.m_time;
-+    return result;
-+}
-+
-+HIPRT_DEVICE hiprtFrameMatrix hiprtGetObjectToWorldFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
-+{
-+    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-+    const hiprt::Transform    tr(
-+           sceneHeader->m_frames,
-+           sceneHeader->m_instances[instanceID].m_frameIndex,
-+           sceneHeader->m_instances[instanceID].m_frameCount );
-+    const hiprt::Frame frame = tr.interpolateFrames( time );
-+
-+	hiprtFrameMatrix result;
-+#if defined( HIPRT_MATRIX_FRAME )
-+	memcpy( result.matrix, frame.m_matrix, sizeof( result.matrix ) );
-+	result.time = frame.m_time;
-+#else
-+	float Q[3][3];
-+	hiprt::qtToRotationMatrix( frame.m_rotation, Q );
-+	for ( uint32_t i = 0; i < 3; ++i )
-+	{
-+		result.matrix[i][0] = Q[i][0] * frame.m_scale.x;
-+		result.matrix[i][1] = Q[i][1] * frame.m_scale.y + Q[i][0] * frame.m_shear.x;
-+		result.matrix[i][2] = Q[i][2] * frame.m_scale.z + Q[i][1] * frame.m_shear.z + Q[i][0] * frame.m_shear.y;
-+	}
-+	result.matrix[0][3] = frame.m_translation.x;
-+	result.matrix[1][3] = frame.m_translation.y;
-+	result.matrix[2][3] = frame.m_translation.z;
-+	result.time         = frame.m_time;
-+#endif
-+    return result;
-+}
-+
-+HIPRT_DEVICE hiprtFrameMatrix hiprtGetWorldToObjectFrameMatrix( hiprtScene scene, uint32_t instanceID, float time )
-+{
-+    const hiprt::SceneHeader* sceneHeader = reinterpret_cast<const hiprt::SceneHeader*>( scene );
-+    const hiprt::Transform    tr(
-+           sceneHeader->m_frames,
-+           sceneHeader->m_instances[instanceID].m_frameIndex,
-+           sceneHeader->m_instances[instanceID].m_frameCount );
-+    const hiprt::Frame frame = tr.interpolateFrames( time );
-+
-+    float matrixInv[3][4];
-+    hiprt::computeInvTransformMatrix( frame, matrixInv );
-+
-+    hiprtFrameMatrix result;
-+    memcpy( result.matrix, matrixInv, sizeof( result.matrix ) );
-+    result.time = frame.m_time;
-+    return result;
-+}
-+
- // explicit template instatiation
- template class hiprtPrivateStack_impl<uint32_t, hiprtPrivateStack::StackSize>;
- template class hiprtGlobalStack_impl<uint32_t, false>;
 --- a/contrib/Orochi/Orochi/Orochi.cpp
 +++ b/contrib/Orochi/Orochi/Orochi.cpp
 @@ -938,8 +938,9 @@
