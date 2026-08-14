@@ -5,10 +5,13 @@ Apply to a checkout of GPUOpen-LibrariesAndSDKs/HIPRT at tag 3.1.0.cb09c56
 
     git -C <HIPRT checkout> apply third_party/hiprt-rocm-fixes.patch
 
-They are bugs in HIP RT and in the copy of Orochi it vendors, not tracer bugs,
-and none of them is fixed at HIP RT HEAD as of 2026-08-14. Contributing them
-upstream to GPUOpen is the durable fix; until they land there this patch is the
-way to reproduce the build.
+They are bugs in HIP RT and in the copy of Orochi it vendors, not tracer bugs.
+Three of the eleven entries below are already fixed on HIP RT's main branch
+(e3c01fc, checked 2026-08-14) and are backported here only because the pinned
+tag predates them: the Compiler init() split, oroSetRawDevice, and the member
+initializer order and loop variable warnings. The other eight are not fixed
+there; contributing those to GPUOpen is the durable fix, and until they land
+this patch is the way to reproduce the build.
 
 The first four entries are one defect in four shapes: a value that describes all
 64 lanes of a wavefront, handled in 32 bits. Three of them are a 64-bit lane mask

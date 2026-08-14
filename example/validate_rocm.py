@@ -2,9 +2,14 @@
 
 Self-contained: builds a small synthetic 2D-Gaussian scene, tessellates it into
 surfel disks exactly the way the README's get_triangles() does, traces it, and
-checks the forward image, all eleven backward gradients, finite-difference
-agreement, a reflected bounce, scenes large enough to reach the multi-block sort
-in the acceleration-structure build, and a cold runtime-compilation cache.
+checks the forward image, the seven backward gradients this scene exercises,
+finite-difference agreement, a reflected bounce, scenes large enough to reach
+the multi-block sort in the acceleration-structure build, and a cold
+runtime-compilation cache.
+
+The tracer returns eleven gradients; ray_o and ray_d are not differentiated
+here, and shs and cov3D_precomp are the alternative parameterization of the
+colors and the scale and rotation pair this scene uses.
 
 Run, from a checkout with the extension installed:
     HIP_VISIBLE_DEVICES=0 python3 example/validate_rocm.py

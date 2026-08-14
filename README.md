@@ -54,10 +54,11 @@ On an AMD GPU with a ROCm build of PyTorch, the tracer runs on [HIP RT](https://
 git clone https://github.com/xbillowy/diff-surfel-tracing.git --recursive
 cd diff-surfel-tracing
 
-# Build HIP RT, applying the fixes it still needs (see the patch header for what
-# each one is for; three are bugs in HIP RT itself and one is in the copy of
-# Orochi it vendors, none of them is fixed at either project's HEAD, and they
-# are tracked for upstream reporting)
+# Build HIP RT, applying the fixes it still needs. They are bugs in HIP RT and
+# in the copy of Orochi it vendors rather than tracer bugs, and most of them are
+# not fixed on HIP RT's main branch either, so they are tracked for reporting
+# there. The patch header describes every entry and says which of them the
+# pinned tag is simply too old to have.
 git -C third_party/hiprt apply ../../third_party/hiprt-rocm-fixes.patch
 export HIP_PATH=/opt/rocm
 cmake -DCMAKE_BUILD_TYPE=Release -DBITCODE=OFF -DNO_UNITTEST=ON -DHIP_PATH=/opt/rocm \
@@ -77,7 +78,7 @@ export HIPRT_HOME=/path/to/hiprt
 
 The AMD back end compiles its trace kernels at runtime rather than ahead of time into PTX, so the first trace after an install is slower while the kernels are compiled and written to the on-disk cache.
 
-To check the installation on your own GPU, run [`example/validate_rocm.py`](example/validate_rocm.py). It needs no downloaded data: it builds a small synthetic surfel scene and checks the forward image, all eleven backward gradients, finite-difference agreement with the analytic gradients, a reflected bounce, scenes large enough to reach the multi-block sort in the acceleration-structure build, and a cold kernel cache.
+To check the installation on your own GPU, run [`example/validate_rocm.py`](example/validate_rocm.py). It needs no downloaded data: it builds a small synthetic surfel scene and checks the forward image, the seven backward gradients that scene exercises, finite-difference agreement with the analytic gradients, a reflected bounce, scenes large enough to reach the multi-block sort in the acceleration-structure build, and a cold kernel cache. The four gradients it leaves out are `ray_o` and `ray_d`, which the scene does not differentiate, and `shs` and `cov3D_precomp`, which are the alternative parameterization of the colors and the scale and rotation pair it does use.
 
 ```bash
 HIP_VISIBLE_DEVICES=0 python3 example/validate_rocm.py
