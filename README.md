@@ -55,7 +55,9 @@ git clone https://github.com/xbillowy/diff-surfel-tracing.git --recursive
 cd diff-surfel-tracing
 
 # Build HIP RT, applying the fixes it still needs (see the patch header for what
-# each one is for; they are HIP RT bugs and are being contributed upstream)
+# each one is for; three are bugs in HIP RT itself and one is in the copy of
+# Orochi it vendors, none of them is fixed at either project's HEAD, and they
+# are tracked for upstream reporting)
 git -C third_party/hiprt apply ../../third_party/hiprt-rocm-fixes.patch
 export HIP_PATH=/opt/rocm
 cmake -DCMAKE_BUILD_TYPE=Release -DBITCODE=OFF -DNO_UNITTEST=ON -DHIP_PATH=/opt/rocm \
