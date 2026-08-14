@@ -85,6 +85,13 @@ else:
         "optix_tracer/auxiliary.h",
     ]
 
+    # The parts of a HIP RT checkout its runtime compiler opens, relative to
+    # HIPRT_PATH. Everything else in that checkout is host-side build material.
+    HIPRT_RUNTIME_SUBDIRS = [
+        "hiprt",
+        "contrib/Orochi/ParallelPrimitives",
+    ]
+
 
 def _build_glue_static_lib():
     os.makedirs(GLUE_BUILD_DIR, exist_ok=True)
@@ -138,11 +145,20 @@ def _stage_runtime_files_into_pkg():
     pkg = os.path.join(ROOT, "diff_surfel_tracing")
     for h in PKG_RUNTIME_HEADERS:
         shutil.copy(os.path.join(ROOT, h), pkg)
-    # HIP RT reads its own BVH-builder kernel sources from HIPRT_PATH at runtime.
+    # HIP RT reads its own BVH-builder kernel sources from HIPRT_PATH at runtime,
+    # so they have to travel with the package. Only these two subtrees are read:
+    # hiprt/ for the builder and traversal kernels, and Orochi's ParallelPrimitives
+    # for the radix sort the builders use (hiprt/impl/RadixSort.cpp). Copying the
+    # whole checkout instead would drag in ~190 MB of history, build output and
+    # vendored test dependencies that are never opened at runtime.
     dst_hiprt = os.path.join(pkg, "hiprt_root")
     if os.path.isdir(dst_hiprt):
         shutil.rmtree(dst_hiprt)
-    shutil.copytree(HIPRT_HOME, dst_hiprt)
+    for sub in HIPRT_RUNTIME_SUBDIRS:
+        src = os.path.join(HIPRT_HOME, *sub.split("/"))
+        if not os.path.isdir(src):
+            raise RuntimeError(f"HIPRT_HOME is missing {sub}: {HIPRT_HOME}")
+        shutil.copytree(src, os.path.join(dst_hiprt, *sub.split("/")))
     if _IS_WIN_HIP:
         hiprt_dll = os.path.join(HIPRT_LIB_DIR, HIPRT_LIB + ".dll")
         if os.path.exists(hiprt_dll):
