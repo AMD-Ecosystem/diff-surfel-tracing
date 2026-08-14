@@ -75,6 +75,12 @@ export HIPRT_HOME=/path/to/hiprt
 
 The AMD back end compiles its trace kernels at runtime rather than ahead of time into PTX, so the first trace after an install is slower while the kernels are compiled and written to the on-disk cache.
 
+To check the installation on your own GPU, run [`example/validate_rocm.py`](example/validate_rocm.py). It needs no downloaded data: it builds a small synthetic surfel scene and checks the forward image, all eleven backward gradients, finite-difference agreement with the analytic gradients, a reflected bounce, scenes large enough to reach the multi-block sort in the acceleration-structure build, and a cold kernel cache.
+
+```bash
+HIP_VISIBLE_DEVICES=0 python3 example/validate_rocm.py
+```
+
 
 ## 🛠️ Usage
 
